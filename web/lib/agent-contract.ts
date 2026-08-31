@@ -33,6 +33,9 @@ export type AgentRequest = {
   learner_profile: LearnerProfile;
   learning_progress?: Record<string, unknown>;
   quiz_blueprint_input?: Record<string, unknown>;
+  /** Explicit confirmation used only by the next-step progress workflow. */
+  force_advance?: boolean;
+  force_reason?: string;
   profile_md_ref?: string;
   profile_md_version?: string;
   profile_md_hash?: string;
@@ -212,4 +215,6 @@ export type OrchestratorInput = {
   qaSessionId?: string;
   learningProgress?: Record<string, unknown>;
   quizBlueprint?: Record<string, unknown>;
+  forceAdvance?: boolean;
+  forceReason?: string;
 };

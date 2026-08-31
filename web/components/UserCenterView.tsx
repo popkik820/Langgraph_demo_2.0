@@ -53,7 +53,6 @@ type UserCenterViewProps = {
   userId: string;
   profile: LearnerProfile;
   assessment: CapabilityAssessment;
-  capabilityOverall: number;
   progress: LearningProgressResult;
   setProfile: Dispatch<SetStateAction<LearnerProfile>>;
   knowledgeGaps: KnowledgeGap[];
@@ -247,13 +246,7 @@ function shortDate(value: string): string {
   });
 }
 
-function UserCenterRadar({
-  items,
-  centerValue,
-}: {
-  items: Array<{ label: string; value: number }>;
-  centerValue: number;
-}) {
+function UserCenterRadar({ items }: { items: Array<{ label: string; value: number }> }) {
   const center = 150;
   const radius = 92;
   const point = (index: number, value: number) => {
@@ -291,9 +284,6 @@ function UserCenterRadar({
             </g>
           );
         })}
-        <circle className="user-center-radar-center" cx={center} cy={center} r="36" />
-        <text className="user-center-radar-value" x={center} y={center - 2}>{Math.round(centerValue)}</text>
-        <text className="user-center-radar-caption" x={center} y={center + 14}>综合暂估</text>
       </svg>
     </div>
   );
@@ -391,7 +381,6 @@ export function UserCenterView({
   userId,
   profile,
   assessment,
-  capabilityOverall,
   progress,
   setProfile,
   knowledgeGaps,
@@ -401,10 +390,10 @@ export function UserCenterView({
   onSaved,
 }: UserCenterViewProps) {
   const [openSections, setOpenSections] = useState({
-    overview: true,
-    gaps: true,
-    matching: true,
-    custom: true,
+    overview: false,
+    gaps: false,
+    matching: false,
+    custom: false,
   });
   const [selectedGap, setSelectedGap] = useState<KnowledgeGap | null>(null);
   const [expandedChapter, setExpandedChapter] = useState("");
@@ -547,9 +536,7 @@ export function UserCenterView({
       <section className="user-center-shell">
         <header className="user-center-header">
           <div>
-            <span className="eyebrow">LEARNER CENTER</span>
             <h2>用户中心</h2>
-            <p>集中查看系统画像、知识漏洞、资源匹配与个性化学习设置。</p>
           </div>
           <button type="button" className="quiet-button" disabled={busy || resourceBusy} onClick={() => void reloadAll()}>
             {busy || resourceBusy ? "同步中…" : "同步最新数据"}
@@ -564,12 +551,12 @@ export function UserCenterView({
           >
             <summary>
               <span className="user-center-disclosure-arrow" aria-hidden="true" />
-              <span><strong>画像概览</strong><small>八维岗位能力画像</small></span>
+              <span><strong>画像概览</strong></span>
               <em>{progress.provisionalMastery} 分</em>
             </summary>
             <div className="user-center-disclosure-body overview-radar-only">
               <section className="user-overview-capability">
-                <UserCenterRadar items={radarItems} centerValue={capabilityOverall} />
+                <UserCenterRadar items={radarItems} />
               </section>
             </div>
           </details>
@@ -581,16 +568,14 @@ export function UserCenterView({
           >
             <summary>
               <span className="user-center-disclosure-arrow" aria-hidden="true" />
-              <span><strong>知识漏洞</strong><small>按课程章节聚合证据</small></span>
+              <span><strong>知识漏洞</strong></span>
               <em>{gapSummary.openCount} 个待处理</em>
             </summary>
             <div className="user-center-disclosure-body">
             <section className="knowledge-gap-view">
               <div className="user-center-section-heading">
                 <div>
-                  <span className="eyebrow">KNOWLEDGE GAP MAP</span>
                   <h3>知识漏洞地图</h3>
-                  <p>数据来自知识漏洞专用接口，按课程 Chapter 聚合并保留每条判断的证据入口。</p>
                 </div>
               </div>
               <div className="gap-stat-strip">
@@ -653,7 +638,7 @@ export function UserCenterView({
           >
             <summary>
               <span className="user-center-disclosure-arrow" aria-hidden="true" />
-              <span><strong>资源匹配</strong><small>资源难度与当前能力对照</small></span>
+              <span><strong>资源匹配</strong></span>
               <em>{overallAlignment === null ? "等待数据" : `${overallAlignment}% 匹配`}</em>
             </summary>
             <div className="user-center-disclosure-body">
@@ -661,9 +646,7 @@ export function UserCenterView({
               <div className="resource-match-toolbar">
                 <div className="user-center-section-heading">
                   <div>
-                    <span className="eyebrow">DIFFICULTY ALIGNMENT</span>
                     <h3>资源难度与用户匹配曲线</h3>
-                    <p>蓝线来自资源难度记录，绿线来自同次记录中的用户能力分数。</p>
                   </div>
                 </div>
                 <label>
@@ -720,16 +703,14 @@ export function UserCenterView({
           >
             <summary>
               <span className="user-center-disclosure-arrow" aria-hidden="true" />
-              <span><strong>自定义画像</strong><small>调整知链的个性化学习方式</small></span>
+              <span><strong>自定义画像</strong></span>
               <em>{profileCompletion}% 完成</em>
             </summary>
             <div className="user-center-disclosure-body">
             <section className="custom-profile-view">
               <div className="custom-profile-intro">
                 <div>
-                  <span className="eyebrow">CUSTOM INSTRUCTIONS</span>
                   <h3>让知链更了解你</h3>
-                  <p>能选择的信息无需手动填写；只有个性化情况保留简短补充。</p>
                 </div>
                 <div className="profile-completion" aria-label={`画像完成度 ${profileCompletion}%`}>
                   <span>画像完成度</span>
@@ -740,7 +721,7 @@ export function UserCenterView({
               <div className="custom-profile-workspace">
                 <div className="custom-profile-sections">
                   <section className="custom-setting-section">
-                    <header><span>01</span><div><h4>关于我</h4><p>选择专业与已有基础，再按需补充个人情况。</p></div></header>
+                    <header><span>01</span><div><h4>关于我</h4></div></header>
                     <div className="custom-setting-body">
                       <fieldset><legend>专业背景 · 单选</legend><div className="profile-choice-row single">
                         {PROFESSION_OPTIONS.map((option) => <button type="button" aria-pressed={customDraft.profession === option} className={customDraft.profession === option ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, profession: option }))} key={option}>{option}</button>)}
@@ -753,28 +734,28 @@ export function UserCenterView({
                   </section>
 
                   <section className="custom-setting-section">
-                    <header><span>02</span><div><h4>当前自评水平</h4><p>仅用于调整内容难度，不会直接改变能力评分。</p></div></header>
+                    <header><span>02</span><div><h4>当前自评水平</h4></div></header>
                     <div className="level-choice-grid">
                       {SELF_LEVEL_OPTIONS.map((option) => <button type="button" aria-pressed={customDraft.level === option.id} className={customDraft.level === option.id ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, level: option.id }))} key={option.id}><strong>{option.title}</strong><span>{option.detail}</span><i aria-hidden="true">✓</i></button>)}
                     </div>
                   </section>
 
                   <section className="custom-setting-section">
-                    <header><span>03</span><div><h4>当前学习目标</h4><p>选择一个或多个近期目标。</p></div></header>
+                    <header><span>03</span><div><h4>当前学习目标</h4></div></header>
                     <div className="custom-setting-body"><div className="profile-choice-row">
                       {GOAL_OPTIONS.map((option) => <button type="button" aria-pressed={customDraft.goals.includes(option)} className={customDraft.goals.includes(option) ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, goals: toggleSelection(current.goals, option) }))} key={option}>{option}</button>)}
                     </div>{customDraft.goals.includes("其他") && <label className="inline-profile-input"><span>其他目标</span><input value={customDraft.goalOther} maxLength={100} placeholder="补充你的学习目标" onChange={(event) => setCustomDraft((current) => ({ ...current, goalOther: event.target.value }))} /></label>}</div>
                   </section>
 
                   <section className="custom-setting-section">
-                    <header><span>04</span><div><h4>我喜欢怎样学习</h4><p>这些偏好会影响回答、Quiz 解析和讲义表达。</p></div></header>
+                    <header><span>04</span><div><h4>我喜欢怎样学习</h4></div></header>
                     <div className="custom-setting-body"><div className="profile-choice-row">
                       {LEARNING_STYLE_OPTIONS.map((option) => <button type="button" aria-pressed={customDraft.learningStyles.includes(option)} className={customDraft.learningStyles.includes(option) ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, learningStyles: toggleSelection(current.learningStyles, option) }))} key={option}>{option}</button>)}
                     </div><label className="inline-profile-input"><span>其他讲解要求 <small>可选</small></span><input value={customDraft.learningOther} maxLength={160} placeholder="例如：关键步骤附上容易犯错的原因" onChange={(event) => setCustomDraft((current) => ({ ...current, learningOther: event.target.value }))} /></label></div>
                   </section>
 
                   <section className="custom-setting-section">
-                    <header><span>05</span><div><h4>内容生成偏好</h4><p>用选择项控制回答、Quiz 与讲义的默认呈现。</p></div></header>
+                    <header><span>05</span><div><h4>内容生成偏好</h4></div></header>
                     <div className="custom-setting-body content-preference-grid">
                       <fieldset><legend>回答详细度</legend><div className="profile-segmented-control">{["简洁", "适中", "详细"].map((option) => <button type="button" aria-pressed={customDraft.answerDetail === option} className={customDraft.answerDetail === option ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, answerDetail: option }))} key={option}>{option}</button>)}</div></fieldset>
                       <fieldset><legend>默认内容难度</legend><div className="profile-segmented-control">{["自动匹配", "偏基础", "偏进阶"].map((option) => <button type="button" aria-pressed={customDraft.contentDifficulty === option} className={customDraft.contentDifficulty === option ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, contentDifficulty: option }))} key={option}>{option}</button>)}</div></fieldset>
@@ -784,7 +765,7 @@ export function UserCenterView({
                   </section>
 
                   <section className="custom-setting-section">
-                    <header><span>06</span><div><h4>我不希望出现</h4><p>提前说明需要避免的表达方式。</p></div></header>
+                    <header><span>06</span><div><h4>我不希望出现</h4></div></header>
                     <div className="custom-setting-body"><div className="profile-choice-row avoidance">
                       {AVOIDANCE_OPTIONS.map((option) => <button type="button" aria-pressed={customDraft.avoidances.includes(option)} className={customDraft.avoidances.includes(option) ? "selected" : ""} onClick={() => setCustomDraft((current) => ({ ...current, avoidances: toggleSelection(current.avoidances, option) }))} key={option}>{option}</button>)}
                     </div><label className="inline-profile-input"><span>其他不希望出现的内容 <small>可选</small></span><input value={customDraft.avoidanceOther} maxLength={160} placeholder="补充特殊要求" onChange={(event) => setCustomDraft((current) => ({ ...current, avoidanceOther: event.target.value }))} /></label></div>
@@ -792,7 +773,6 @@ export function UserCenterView({
                 </div>
 
                 <aside className="profile-live-preview">
-                  <span className="eyebrow">LIVE PREVIEW</span>
                   <h4>知链将这样帮助你</h4>
                   <p>{customDraft.profession || "未选择专业"} · {SELF_LEVEL_OPTIONS.find((option) => option.id === customDraft.level)?.title}</p>
                   <dl>

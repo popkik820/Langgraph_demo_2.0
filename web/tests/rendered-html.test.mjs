@@ -33,6 +33,7 @@ import {
   createLectureSession,
   normalizeLectureSessions,
 } from "../lib/lecture-session.ts";
+import { normalizeGeneratedMarkdown } from "../lib/markdown-content.ts";
 
 async function loadWorker() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -51,6 +52,19 @@ const context = {
   waitUntil() {},
   passThroughOnException() {},
 };
+
+test("opens the user center with all four sections collapsed", async () => {
+  const source = await readFile(
+    new URL("../components/UserCenterView.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /overview: false/);
+  assert.match(source, /gaps: false/);
+  assert.match(source, /matching: false/);
+  assert.match(source, /custom: false/);
+  assert.doesNotMatch(source, /user-center-radar-center/);
+  assert.doesNotMatch(source, /综合暂估/);
+});
 
 test("uses backend profile-score as the authoritative eight-dimension source", () => {
   const normalized = normalizeCapabilityScoresPayload({
@@ -244,6 +258,16 @@ test("renders assistant answers as safe structured Markdown", async () => {
   assert.match(styles, /\.markdown-table-wrap/);
 });
 
+test("repairs legacy inline headings and malformed bold markers", () => {
+  const normalized = normalizeGeneratedMarkdown(
+    "先断电。 ### 第二步：检查工具\n\n练习 1**题目： **控制对象是什么？\n\n清理完成。 - 检查柜门",
+  );
+
+  assert.match(normalized, /先断电。\n\n### 第二步：检查工具/);
+  assert.match(normalized, /练习 1\n\n\*\*题目：\*\* 控制对象是什么/);
+  assert.match(normalized, /清理完成。\n\n- 检查柜门/);
+});
+
 test("grounds vague questions in the CNC course and forwards Memory context", async () => {
   const projectRoot = new URL("../", import.meta.url);
   const [workspace, state, inputRouter, generators, personalization, domainContext, courseManifest] =
@@ -297,7 +321,9 @@ test("grounds vague questions in the CNC course and forwards Memory context", as
   assert.match(workspace, /const QA_CONTEXT_VERSION = "cnc-domain-v2"/);
   assert.match(workspace, /snapshot\.qa_context_version === QA_CONTEXT_VERSION/);
   assert.match(workspace, /knowledge_domain/);
-  assert.match(workspace, /active_learning_topic: recommendations\.primaryTopic/);
+  assert.match(workspace, /active_learning_topic: sectionContext/);
+  assert.match(workspace, /: recommendations\.primaryTopic/);
+  assert.match(workspace, /chapterId: sectionContext\?\.chapter_id \|\| ACTIVE_CHAPTER_ID/);
   assert.match(workspace, /recent_memory: memoryEvents/);
   assert.match(state, /learner_profile: dict\[str, Any\]/);
   assert.match(state, /latest_scores: dict\[str, float\]/);
@@ -864,7 +890,7 @@ test("keeps Quiz history and RAG fields in the workspace snapshot", async () => 
     readFile(new URL("lib/quiz-session.ts", projectRoot), "utf8"),
   ]);
 
-  assert.match(workspace, /Quiz 历史/);
+  assert.match(workspace, /题库历史/);
   assert.match(workspace, /继续作答/);
   assert.match(workspace, /quiz_sessions: quizSessions\.slice/);
   assert.match(stateClient, /quiz_sessions: QuizSession\[\]/);
@@ -872,6 +898,25 @@ test("keeps Quiz history and RAG fields in the workspace snapshot", async () => 
   assert.match(server, /workspace_state\.json/);
   assert.match(quizModel, /ragChunkIds/);
   assert.match(quizModel, /knowledgeBaseVersion/);
+});
+
+test("locks Quiz generation and history to the selected learning section", async () => {
+  const projectRoot = new URL("../", import.meta.url);
+  const workspace = await readFile(
+    new URL("components/LearningWorkspace.tsx", projectRoot),
+    "utf8",
+  );
+
+  assert.match(workspace, /知识范围已锁定为章节 \$\{requestChapterId\}/);
+  assert.match(workspace, /session\.chapterId === currentChapterId/);
+  assert.match(workspace, /第 \{versionNumber\} 套题库/);
+  assert.match(workspace, /再次生成/);
+  assert.match(workspace, /题目数量/);
+  assert.doesNotMatch(workspace, />个性化测验</);
+  assert.doesNotMatch(workspace, />Memory 推荐主题</);
+  assert.doesNotMatch(workspace, /id="quiz-topic"/);
+  assert.doesNotMatch(workspace, /id="quiz-focus"/);
+  assert.doesNotMatch(workspace, /id="quiz-difficulty"/);
 });
 
 test("calculates job progress from evidence instead of the self-declared profile level", () => {
@@ -1106,8 +1151,18 @@ test("normalizes saved lecture history and wires confirmation, persistence and R
   assert.deepEqual(normalizeLectureSessions([]), []);
   assert.match(workspace, /label: "学习讲义"/);
   assert.match(workspace, /重新生成/);
-  assert.match(workspace, /生成下阶段讲义/);
-  assert.match(workspace, /仍然生成下阶段讲义/);
+  assert.doesNotMatch(workspace, />生成下阶段讲义</);
+  assert.match(workspace, /本节讲义记录/);
+  assert.match(workspace, /sectionSessions\.map/);
+  assert.match(workspace, /第 \{versionNumber\} 版讲义/);
+  assert.match(workspace, /formatLectureHistoryTimestamp/);
+  assert.doesNotMatch(workspace, /仅显示当前小节的历史版本/);
+  assert.match(workspace, /evaluateLearningSectionReadiness/);
+  assert.match(workspace, /进入下一小节/);
+  assert.match(workspace, /您对当前小节掌握得很好/);
+  assert.match(workspace, /您对当前小节的掌握度不足/);
+  assert.match(workspace, /confirmSectionAdvance/);
+  assert.match(workspace, /contentType: "next_step"/);
   assert.match(workspace, /lecture_sessions: lectureSessions\.slice/);
   assert.match(workspace, /contentType: "lecture"/);
   assert.match(stateClient, /lecture_sessions: LectureSession\[\]/);
@@ -1135,10 +1190,21 @@ test("streams and displays the complete multi-Agent collaboration lifecycle", as
   assert.match(orchestrator, /onRunCreated/);
   assert.match(orchestrator, /onEvent/);
   assert.match(workspace, /多 Agent 协作/);
+  assert.match(workspace, /AGENT_RING/);
+  assert.match(workspace, /agent-orbit-stage/);
+  assert.match(workspace, /任务调度/);
+  assert.match(workspace, /知识生成/);
+  assert.match(workspace, /学情管理/);
+  assert.match(workspace, /个性生成/);
+  assert.match(workspace, /幻觉消除/);
+  assert.match(workspace, /实训评估/);
   assert.match(workspace, /当前运行状态/);
   assert.match(workspace, /Agent 协作流/);
   assert.match(workspace, /节点执行时间线/);
   assert.match(workspace, /payload_refs/);
   assert.match(styles, /\.handoff-item/);
   assert.match(styles, /\.event-payload-list/);
+  assert.match(styles, /\.agent-orbit-node\.working/);
+  assert.match(styles, /@keyframes agent-ring-drift/);
+  assert.match(styles, /@keyframes agent-node-breathe/);
 });

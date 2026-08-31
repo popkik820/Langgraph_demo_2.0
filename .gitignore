@@ -9,13 +9,22 @@
 **/__pycache__/
 *.py[cod]
 
+# Local agent/Codex metadata and editor caches
+**/.codex/
+**/.agents/
+**/.cache/
+**/.runtime/
+.DS_Store
+Thumbs.db
+
 # Frontend dependencies and build output
 web/node_modules/
 web/dist/
 web/.next/
 web/.vinext/
 web/.wrangler/
-web/.cache/
+web/coverage/
+web/tmp/
 *.tsbuildinfo
 
 # Learner runtime data and rebuildable RAG indexes

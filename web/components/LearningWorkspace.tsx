@@ -59,6 +59,11 @@ import {
   type UserLearningPath,
 } from "@/lib/learning-path-client";
 import {
+  evaluateLearningSectionReadiness,
+  readinessBlockerMessages,
+  type LearningSectionReadiness,
+} from "@/lib/learning-advance-client";
+import {
   loadCapabilityScores,
   type CapabilityScoresState,
 } from "@/lib/capability-score-client";
@@ -114,7 +119,6 @@ import {
   type QuizQuestionType,
 } from "@/lib/quiz-blueprint";
 import {
-  COURSE_PHASES,
   calculateLearningProgress,
   type LearningProgressResult,
   type ProgressGate,
@@ -150,6 +154,23 @@ type PendingSuggestion = {
   id: string;
   kind: "profile";
   patch: ProfilePatch;
+};
+
+type SectionMaterialStepStatus =
+  | "pending"
+  | "generating"
+  | "ready"
+  | "reused"
+  | "failed";
+
+type SectionMaterialPreparation = {
+  userId: string;
+  sectionId: string;
+  sectionTitle: string;
+  status: "generating" | "ready" | "failed";
+  lectureStatus: SectionMaterialStepStatus;
+  quizStatus: SectionMaterialStepStatus;
+  error: string;
 };
 
 type LocalWorkspaceCache = {
@@ -210,6 +231,40 @@ const AGENT_LABELS: Record<string, string> = {
   practice_evaluation: "实训评估 Agent",
 };
 
+const AGENT_RING = [
+  { id: "task_dispatch", label: "任务调度", symbol: "调", position: "top" },
+  {
+    id: "knowledge_generation",
+    label: "知识生成",
+    symbol: "知",
+    position: "upper-right",
+  },
+  {
+    id: "personalized_generation",
+    label: "个性生成",
+    symbol: "个",
+    position: "lower-right",
+  },
+  {
+    id: "hallucination_elimination",
+    label: "幻觉消除",
+    symbol: "验",
+    position: "bottom",
+  },
+  {
+    id: "practice_evaluation",
+    label: "实训评估",
+    symbol: "评",
+    position: "lower-left",
+  },
+  {
+    id: "learning_management",
+    label: "学情管理",
+    symbol: "学",
+    position: "upper-left",
+  },
+] as const;
+
 const RUN_STATUS_LABELS: Record<GraphRunStatus, string> = {
   idle: "等待任务",
   created: "任务已创建",
@@ -265,15 +320,34 @@ function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}`;
 }
 
-function learningMaterialLabel(materialType: string): string {
-  const labels: Record<string, string> = {
-    lecture: "学习讲义",
-    quiz: "Quiz 测评",
-    practice: "实训练习",
-    simulation: "仿真训练",
-    qa: "问答辅导",
-  };
-  return labels[materialType] || materialType;
+function latestQuizForSection(
+  sessions: QuizSession[],
+  sectionId: string,
+): QuizSession | null {
+  return (
+    sessions
+      .filter((session) => session.chapterId === sectionId)
+      .sort(
+        (left, right) =>
+          new Date(right.createdAt).getTime() -
+          new Date(left.createdAt).getTime(),
+      )[0] ?? null
+  );
+}
+
+function latestLectureForSection(
+  sessions: LectureSession[],
+  sectionId: string,
+): LectureSession | null {
+  return (
+    sessions
+      .filter((session) => session.chapterId === sectionId)
+      .sort(
+        (left, right) =>
+          new Date(right.createdAt).getTime() -
+          new Date(left.createdAt).getTime(),
+      )[0] ?? null
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -722,8 +796,28 @@ export default function LearningWorkspace() {
   const [userLearningPath, setUserLearningPath] = useState<UserLearningPath | null>(null);
   const [learningPathLoading, setLearningPathLoading] = useState(false);
   const [learningPathError, setLearningPathError] = useState("");
+  const [learningSectionContextId, setLearningSectionContextId] = useState("");
+  const [, setSectionMaterialPreparation] =
+    useState<SectionMaterialPreparation | null>(null);
   const persistenceRevision = useRef(0);
   const profileEvidenceSyncKey = useRef("");
+  const activeUserIdRef = useRef("");
+  const materialGenerationEpoch = useRef(0);
+  const materialGenerationLocks = useRef(new Set<string>());
+  const quizSessionsRef = useRef<QuizSession[]>([]);
+  const lectureSessionsRef = useRef<LectureSession[]>([]);
+
+  useEffect(() => {
+    activeUserIdRef.current = activeUserId;
+  }, [activeUserId]);
+
+  useEffect(() => {
+    quizSessionsRef.current = quizSessions;
+  }, [quizSessions]);
+
+  useEffect(() => {
+    lectureSessionsRef.current = lectureSessions;
+  }, [lectureSessions]);
 
   useEffect(() => {
     try {
@@ -904,6 +998,12 @@ export default function LearningWorkspace() {
     setGraphRunStatus("idle");
     setLastResponse(null);
     setQaSessionId("");
+    setLearningSectionContextId("");
+    setSectionMaterialPreparation(null);
+    materialGenerationEpoch.current += 1;
+    materialGenerationLocks.current.clear();
+    quizSessionsRef.current = [];
+    lectureSessionsRef.current = [];
     setUserIdentity({
       ...DEFAULT_USER_IDENTITY,
       nickname: user?.display_name?.trim() || DEFAULT_USER_IDENTITY.nickname,
@@ -1427,32 +1527,418 @@ export default function LearningWorkspace() {
   const pageMeta = {
     chat: {
       title: "聊天问答",
-      detail: "基于当前用户画像与领域知识生成个性化回答",
     },
     quiz: {
       title: "Quiz 生成",
-      detail: "让中央调度器生成、审查并返回结构化测验",
     },
     lecture: {
       title: "学习讲义",
-      detail: "根据当前画像、学习进度与知识库生成个性化阶段讲义",
     },
     memory: {
       title: "用户中心",
-      detail: "查看学习画像、知识漏洞、资源匹配与个性化设置",
     },
     progress: {
       title: "学习进度",
-      detail: "依据学习证据评估从行业入门到岗位胜任的成长阶段",
     },
   }[activeView];
+
+  const officialLearningSectionId =
+    userLearningPath?.current_chapter_id ||
+    learningProgress.currentChapterId ||
+    ACTIVE_CHAPTER_ID;
+  const learningSectionContext =
+    userLearningPath?.chapters.find(
+      (chapter) => chapter.chapter_id === learningSectionContextId,
+    ) ??
+    userLearningPath?.chapters.find(
+      (chapter) => chapter.chapter_id === officialLearningSectionId,
+    ) ??
+    null;
+  const effectiveLearningSectionId =
+    learningSectionContext?.chapter_id || officialLearningSectionId;
+
+  function openLearningSectionView(
+    view: Extract<View, "chat" | "quiz" | "lecture">,
+    sectionId: string,
+  ) {
+    const targetSectionId =
+      userLearningPath?.chapters.some(
+        (chapter) => chapter.chapter_id === sectionId,
+      )
+        ? sectionId
+        : officialLearningSectionId;
+    setLearningSectionContextId(
+      targetSectionId === officialLearningSectionId ? "" : targetSectionId,
+    );
+    if (view === "quiz") {
+      setActiveQuizSessionId(
+        quizSessions.find((session) => session.chapterId === targetSectionId)
+          ?.id || "",
+      );
+    }
+    if (view === "lecture") {
+      setActiveLectureSessionId(
+        lectureSessions.find((session) => session.chapterId === targetSectionId)
+          ?.id || "",
+      );
+    }
+    setActiveView(view);
+  }
+
+  function navigateFromSidebar(view: View) {
+    if (view === "chat" || view === "quiz" || view === "lecture") {
+      openLearningSectionView(view, officialLearningSectionId);
+      return;
+    }
+    setActiveView(view);
+  }
+
+  async function prepareLearningSectionMaterials(input: {
+    userId: string;
+    section: LearningPathChapter;
+    bootstrapResponse?: AgentResponse;
+  }) {
+    const { userId, section, bootstrapResponse } = input;
+    const sectionId = section.chapter_id;
+    const lockKey = `${userId}:${sectionId}`;
+    if (materialGenerationLocks.current.has(lockKey)) return;
+    materialGenerationLocks.current.add(lockKey);
+    const epoch = materialGenerationEpoch.current;
+    const isCurrentRequest = () =>
+      materialGenerationEpoch.current === epoch &&
+      activeUserIdRef.current === userId;
+    const updatePreparation = (
+      update: Partial<SectionMaterialPreparation>,
+    ) => {
+      if (!isCurrentRequest()) return;
+      setSectionMaterialPreparation((current) => ({
+        userId,
+        sectionId,
+        sectionTitle: section.chapter_title,
+        status: "generating",
+        lectureStatus: "pending",
+        quizStatus: "pending",
+        error: "",
+        ...(current?.userId === userId && current.sectionId === sectionId
+          ? current
+          : {}),
+        ...update,
+      }));
+    };
+    const storeLecture = (session: LectureSession) => {
+      if (!isCurrentRequest()) return;
+      const next = upsertLectureSession(lectureSessionsRef.current, session);
+      lectureSessionsRef.current = next;
+      setLectureSessions(next);
+      setActiveLectureSessionId(session.id);
+    };
+    const storeQuiz = (session: QuizSession) => {
+      if (!isCurrentRequest()) return;
+      const next = upsertQuizSession(quizSessionsRef.current, session);
+      quizSessionsRef.current = next;
+      setQuizSessions(next);
+      setActiveQuizSessionId(session.id);
+    };
+
+    let lecture = latestLectureForSection(
+      lectureSessionsRef.current,
+      sectionId,
+    );
+    let quiz = latestQuizForSection(quizSessionsRef.current, sectionId);
+    const errors: string[] = [];
+    updatePreparation({
+      status: lecture && quiz ? "ready" : "generating",
+      lectureStatus: lecture ? "reused" : "pending",
+      quizStatus: quiz ? "reused" : "pending",
+      error: "",
+    });
+
+    try {
+      if (lecture) setActiveLectureSessionId(lecture.id);
+      if (quiz) setActiveQuizSessionId(quiz.id);
+      if (lecture && quiz) return;
+
+      if (!lecture && bootstrapResponse) {
+        try {
+          lecture = createLectureSession({
+            id: uid("lecture-session"),
+            courseId: ACTIVE_COURSE_ID,
+            chapterId: sectionId,
+            chapterTitle: section.chapter_title,
+            response: bootstrapResponse,
+            capabilityEvidence: effectiveCapabilityEvidence,
+            generationReason: "next_stage",
+            predecessorId: null,
+          });
+          storeLecture(lecture);
+          updatePreparation({ lectureStatus: "ready" });
+        } catch {
+          // Some next_step responses only contain progress metadata. A
+          // dedicated lecture request below completes the missing material.
+        }
+      }
+
+      if (!lecture) {
+        updatePreparation({ lectureStatus: "generating" });
+        try {
+          const lectureResponse = await dispatchToCentralOrchestrator(
+            buildAgentRequest({
+              userId,
+              courseId: ACTIVE_COURSE_ID,
+              chapterId: sectionId,
+              prompt: [
+                `为当前学习小节“${sectionId} ${section.chapter_title}”生成结构化学习讲义。`,
+                `严格限定在该小节，核心范围：${section.focus.summary || section.chapter_title}。`,
+                "只使用与本小节直接相关的 RAG 证据；不得混入其他小节内容。",
+              ].join("\n"),
+              contentType: "lecture",
+              scores,
+              profile,
+              learningProgress: learningProgress.agentContext,
+            }),
+          );
+          assertSuccessfulAgentResponse(lectureResponse, "讲义");
+          lecture = createLectureSession({
+            id: uid("lecture-session"),
+            courseId: ACTIVE_COURSE_ID,
+            chapterId: sectionId,
+            chapterTitle: section.chapter_title,
+            response: lectureResponse,
+            capabilityEvidence: effectiveCapabilityEvidence,
+            generationReason: "next_stage",
+            predecessorId: null,
+          });
+          storeLecture(lecture);
+          updatePreparation({ lectureStatus: "ready" });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "讲义生成失败";
+          errors.push(`讲义：${message}`);
+          updatePreparation({ lectureStatus: "failed" });
+        }
+      }
+
+      if (!quiz && bootstrapResponse) {
+        try {
+          const generated = asQuizQuestions(bootstrapResponse);
+          if (generated.length >= MIN_QUIZ_QUESTION_COUNT) {
+            const bootstrapBlueprint = createQuizBlueprint(
+              generated.length,
+              scores,
+            );
+            const questions = bootstrapBlueprint.map((slot, index) =>
+              applyBlueprintToQuestion(generated[index], slot),
+            );
+            quiz = createQuizSession({
+              id: uid("quiz-session"),
+              courseId: ACTIVE_COURSE_ID,
+              chapterId: sectionId,
+              topic: `${sectionId} ${section.chapter_title}`,
+              focus: `只考查当前小节“${section.chapter_title}”的知识目标与安全边界。`,
+              difficulty:
+                profile.level === "advanced"
+                  ? "hard"
+                  : profile.level === "intermediate"
+                    ? "medium"
+                    : "easy",
+              questions,
+              response: bootstrapResponse,
+              assessmentLink: lecture
+                ? {
+                    lectureId: lecture.id,
+                    chapterId: sectionId,
+                    objectiveIds: lecture.objectiveIds,
+                  }
+                : null,
+            });
+            storeQuiz(quiz);
+            updatePreparation({ quizStatus: "ready" });
+          }
+        } catch {
+          // Fall through to the dedicated section Quiz request.
+        }
+      }
+
+      if (!quiz) {
+        updatePreparation({ quizStatus: "generating" });
+        try {
+          const blueprint = createQuizBlueprint(
+            MIN_QUIZ_QUESTION_COUNT,
+            scores,
+          );
+          const topic = `${sectionId} ${section.chapter_title}`;
+          const focus = `只考查当前小节“${topic}”的知识目标、核心概念、安全边界与实际应用，不得混入其他小节内容。`;
+          const quizResponse = await dispatchToCentralOrchestrator(
+            buildAgentRequest({
+              userId,
+              courseId: ACTIVE_COURSE_ID,
+              chapterId: sectionId,
+              prompt: [
+                `严格围绕当前小节“${topic}”生成 ${blueprint.length} 道入门练习题。`,
+                focus,
+                "必须依据本次 RAG 证据并逐项执行 JSON 蓝图；返回顺序与蓝图一致。",
+                "判断题 answer 必须为 A（正确）或 B（错误），主观题必须返回 reference_answer 与 scoring_rubric.key_points。",
+                `QUIZ_BLUEPRINT=${JSON.stringify(blueprint)}`,
+              ].join("\n"),
+              contentType: "quiz",
+              scores,
+              profile,
+              learningProgress: learningProgress.agentContext,
+              quizBlueprint: {
+                question_count: blueprint.length,
+                slots: blueprint.map((slot) => ({
+                  sequence: slot.sequence,
+                  question_type: slot.questionType,
+                  difficulty: slot.difficulty,
+                  points: slot.points,
+                  capability_dimension: slot.capabilityDimension,
+                  question_purpose: "chapter_core",
+                  related_gap_ids: [],
+                })),
+              },
+            }),
+          );
+          assertSuccessfulAgentResponse(quizResponse, "Quiz");
+          const generated = asQuizQuestions(quizResponse);
+          if (generated.length < blueprint.length) {
+            throw new Error(
+              `中央调度器只返回 ${generated.length}/${blueprint.length} 道有效题目`,
+            );
+          }
+          const questions = blueprint.map((slot, index) =>
+            applyBlueprintToQuestion(generated[index], slot),
+          );
+          quiz = createQuizSession({
+            id: uid("quiz-session"),
+            courseId: ACTIVE_COURSE_ID,
+            chapterId: sectionId,
+            topic,
+            focus,
+            difficulty:
+              profile.level === "advanced"
+                ? "hard"
+                : profile.level === "intermediate"
+                  ? "medium"
+                  : "easy",
+            questions,
+            response: quizResponse,
+            assessmentLink: lecture
+              ? {
+                  lectureId: lecture.id,
+                  chapterId: sectionId,
+                  objectiveIds: lecture.objectiveIds,
+                }
+              : null,
+          });
+          storeQuiz(quiz);
+          updatePreparation({ quizStatus: "ready" });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Quiz 生成失败";
+          errors.push(`Quiz：${message}`);
+          updatePreparation({ quizStatus: "failed" });
+        }
+      }
+
+      if (!isCurrentRequest()) return;
+      if (lecture && quiz) {
+        updatePreparation({ status: "ready", error: "" });
+        setMemoryEvents((events) => [
+          {
+            id: uid("section-ready"),
+            title: "新小节学习资料已准备",
+            detail: `已为 ${sectionId} ${section.chapter_title} 加载或生成讲义与 Quiz。`,
+            time: new Date().toLocaleString("zh-CN", {
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          },
+          ...events,
+        ]);
+        setToast({ text: `${sectionId} 的讲义与 Quiz 已准备好` });
+      } else {
+        updatePreparation({
+          status: "failed",
+          error: errors.join("；") || "部分学习资料尚未准备完成",
+        });
+      }
+    } finally {
+      materialGenerationLocks.current.delete(lockKey);
+    }
+  }
+
+  async function advanceLearningSection(
+    sectionId: string,
+    force: boolean,
+  ): Promise<string> {
+    if (!activeUserId) throw new Error("请先选择学习者");
+    const currentSection = userLearningPath?.chapters.find(
+      (chapter) => chapter.chapter_id === sectionId,
+    );
+    const nextSection = userLearningPath?.chapters.find(
+      (chapter) => chapter.chapter_id === currentSection?.next_chapter_id,
+    );
+    if (!currentSection || !nextSection) throw new Error("当前小节没有可进入的下一小节");
+
+    const response = await runAgent(
+      buildAgentRequest({
+        userId: activeUserId,
+        courseId: ACTIVE_COURSE_ID,
+        chapterId: sectionId,
+        prompt: force
+          ? `学习者已确认在尚未完全达标的情况下，从 ${sectionId} 进入下一小节。请推进学习进度并加载下一小节资料。`
+          : `当前小节 ${sectionId} 已通过后端学习资格评估。请推进至下一小节并加载对应资料。`,
+        contentType: "next_step",
+        scores,
+        profile,
+        learningProgress: learningProgress.agentContext,
+        forceAdvance: force,
+        forceReason: force
+          ? "用户已在前端二次确认，保留当前小节待补学状态后进入下一小节"
+          : "",
+      }),
+    );
+
+    const refreshedPath = await loadUserLearningPath(
+      activeUserId,
+      ACTIVE_COURSE_ID,
+    );
+    setUserLearningPath(refreshedPath);
+    const targetSectionId =
+      refreshedPath.current_chapter_id || nextSection.chapter_id;
+    const targetSection = refreshedPath.chapters.find(
+      (chapter) => chapter.chapter_id === targetSectionId,
+    );
+    setLearningSectionContextId("");
+    const existingQuiz = latestQuizForSection(quizSessionsRef.current, targetSectionId);
+    const existingLecture = latestLectureForSection(
+      lectureSessionsRef.current,
+      targetSectionId,
+    );
+    setActiveQuizSessionId(existingQuiz?.id || "");
+    setActiveLectureSessionId(existingLecture?.id || "");
+    await refreshMemory(false);
+    const materialSection = targetSection || nextSection;
+    setToast({
+      text:
+        existingQuiz && existingLecture
+          ? `已进入 ${targetSectionId}，并打开现有最新学习资料`
+          : `已进入 ${targetSectionId}，正在准备本节讲义与 Quiz`,
+    });
+    void prepareLearningSectionMaterials({
+      userId: activeUserId,
+      section: materialSection,
+      bootstrapResponse: response,
+    });
+    return targetSectionId;
+  }
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       {!sidebarCollapsed && (
         <Sidebar
           activeView={activeView}
-          setActiveView={setActiveView}
+          setActiveView={navigateFromSidebar}
           connection={connection}
           userIdentity={userIdentity}
           setUserIdentity={setUserIdentity}
@@ -1479,7 +1965,6 @@ export default function LearningWorkspace() {
             )}
             <div className="page-heading">
               <h1>{pageMeta.title}</h1>
-              <p>{pageMeta.detail}</p>
             </div>
           </div>
           <div className="topbar-actions">
@@ -1500,6 +1985,7 @@ export default function LearningWorkspace() {
           {activeView === "chat" && (
             <ChatView
               userId={activeUserId}
+              sectionContext={learningSectionContext}
               messages={messages}
               setMessages={setMessages}
               history={history}
@@ -1521,22 +2007,21 @@ export default function LearningWorkspace() {
               busy={busy}
               profile={profile}
               scores={scores}
-              recommendations={learningRecommendations}
               runAgent={runAgent}
               sessions={quizSessions}
               activeLecture={
                 lectureSessions.find(
                   (lecture) =>
                     lecture.id === activeLectureSessionId &&
-                    (!userLearningPath ||
-                      userLearningPath.chapters.some(
-                        (chapter) => chapter.chapter_id === lecture.chapterId,
-                      )),
-                ) ?? null
+                    lecture.chapterId === effectiveLearningSectionId,
+                ) ??
+                lectureSessions.find(
+                  (lecture) => lecture.chapterId === effectiveLearningSectionId,
+                ) ??
+                null
               }
-              currentChapterId={
-                userLearningPath?.current_chapter_id || ACTIVE_CHAPTER_ID
-              }
+              currentChapterId={effectiveLearningSectionId}
+              currentChapterTitle={learningSectionContext?.chapter_title || ""}
               activeSessionId={activeQuizSessionId}
               onActiveSessionChange={setActiveQuizSessionId}
               onSessionChange={(session) =>
@@ -1635,6 +2120,7 @@ export default function LearningWorkspace() {
               scores={scores}
               progress={learningProgress}
               learningPath={userLearningPath}
+              sectionContextId={effectiveLearningSectionId}
               capabilityEvidence={effectiveCapabilityEvidence}
               busy={busy}
               runAgent={runAgent}
@@ -1646,10 +2132,6 @@ export default function LearningWorkspace() {
               userId={activeUserId}
               profile={profile}
               assessment={capabilityAssessment}
-              capabilityOverall={
-                activeBackendCapabilityScores?.profileScore.overall ??
-                learningProgress.provisionalMastery
-              }
               progress={learningProgress}
               setProfile={setProfile}
               knowledgeGaps={effectiveKnowledgeGaps}
@@ -1662,11 +2144,14 @@ export default function LearningWorkspace() {
           )}
           {activeView === "progress" && (
             <LearningProgressView
+              userId={activeUserId}
               progress={learningProgress}
               learningPath={userLearningPath}
               learningPathLoading={learningPathLoading}
               learningPathError={learningPathError}
-              onNavigate={setActiveView}
+              onNavigate={openLearningSectionView}
+              busy={busy}
+              onAdvance={advanceLearningSection}
             />
           )}
         </div>
@@ -1825,6 +2310,7 @@ function ChatView({
   qaSessionId,
   setQaSessionId,
   recommendations,
+  sectionContext,
 }: {
   userId: string;
   messages: ChatMessage[];
@@ -1840,6 +2326,7 @@ function ChatView({
   qaSessionId: string;
   setQaSessionId: React.Dispatch<React.SetStateAction<string>>;
   recommendations: LearningRecommendations;
+  sectionContext: LearningPathChapter | null;
 }) {
   const [input, setInput] = useState("");
   const [historyPanelCollapsed, setHistoryPanelCollapsed] = useState(false);
@@ -1892,14 +2379,16 @@ function ChatView({
     const request = buildAgentRequest({
       userId,
       courseId: ACTIVE_COURSE_ID,
-      chapterId: ACTIVE_CHAPTER_ID,
+      chapterId: sectionContext?.chapter_id || ACTIVE_CHAPTER_ID,
       prompt: clean,
       contentType: "qa",
       scores,
       profile: {
         ...profile,
         knowledge_domain: "数控车铣加工、多轴数控加工与数控机床安全操作",
-        active_learning_topic: recommendations.primaryTopic,
+        active_learning_topic: sectionContext
+          ? `${sectionContext.chapter_id} ${sectionContext.chapter_title}`
+          : recommendations.primaryTopic,
         recent_memory: memoryEvents
           .slice(0, 6)
           .map((event) => `${event.title}：${event.detail}`),
@@ -1954,6 +2443,14 @@ function ChatView({
       className={`chat-layout ${showWelcome && !showHistory ? "welcome-layout" : ""} ${historyPanelCollapsed ? "history-panel-collapsed" : ""}`}
     >
       <section className={`chat-panel ${showWelcome ? "welcome-state" : ""}`}>
+        {sectionContext && (
+          <div className="learning-section-context" aria-label="当前问答学习小节">
+            <span>当前讨论小节</span>
+            <strong>
+              {sectionContext.chapter_id} {sectionContext.chapter_title}
+            </strong>
+          </div>
+        )}
         <div className="message-scroll" ref={scrollRef}>
           <div className="messages">
             {showWelcome && (
@@ -2222,6 +2719,26 @@ function graphPayloadSummary(payloadRefs?: GraphPayloadRefs) {
   }));
 }
 
+function traceAgentId(node: string): string {
+  if (/input|router|dispatch/.test(node)) return "task_dispatch";
+  if (/feedback|profile|progress_advance|learning_path/.test(node)) {
+    return "learning_management";
+  }
+  if (/personalization|rewrite/.test(node)) return "personalized_generation";
+  if (/claim|verification|risk|safe_reject|evidence_selector|check_agent|safety/.test(node)) {
+    return "hallucination_elimination";
+  }
+  if (/practice|operation|cnc|measurement|simulation|review/.test(node)) {
+    return "practice_evaluation";
+  }
+  return "knowledge_generation";
+}
+
+function shortAgentActivity(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > 16 ? `${text.slice(0, 16)}…` : text;
+}
+
 function AgentActivity({
   busy,
   trace,
@@ -2257,6 +2774,91 @@ function AgentActivity({
   const displayed = graphEvents.length ? [] : busy ? PENDING_TRACE : trace;
   const ragEvidence = response?.rag_package?.evidence ?? [];
   const effectiveStatus = busy && runStatus === "created" ? "running" : runStatus;
+
+  if (compact) {
+    const latestEvent = graphEvents.at(-1);
+    const latestMessage =
+      latestEvent?.event_type === "agent.message" ? latestEvent : undefined;
+    const activeAgentId =
+      effectiveStatus === "running"
+        ? latestEvent?.event_type === "agent.activity"
+          ? latestEvent.agent_id
+          : latestMessage?.to_agent || latestActivity?.agent_id || "task_dispatch"
+        : effectiveStatus === "failed" || effectiveStatus === "cancelled"
+          ? latestActivity?.agent_id
+          : undefined;
+    const visitedAgentIds = new Set(
+      activities
+        .map((event) => event.agent_id)
+        .filter((agentId): agentId is string => Boolean(agentId)),
+    );
+    trace.forEach((item) => {
+      if (item.status !== "queued") visitedAgentIds.add(traceAgentId(item.node));
+    });
+    const latestActivityByAgent = new Map<string, AgentActivityEvent>();
+    activities.forEach((event) => {
+      if (event.agent_id) latestActivityByAgent.set(event.agent_id, event);
+    });
+
+    return (
+      <section
+        className="activity-panel sidebar-agent-activity agent-orbit-panel"
+        data-run-id={runId || undefined}
+      >
+        <div className="agent-orbit-heading">
+          <h3>多 Agent 协作</h3>
+          <span className={`agent-orbit-live-dot ${effectiveStatus}`} aria-hidden="true" />
+        </div>
+        <div className={`agent-orbit-stage ${effectiveStatus}`}>
+          <div className="agent-orbit-track" aria-hidden="true">
+            <span className="agent-orbit-pulse" />
+          </div>
+          <div className={`agent-orbit-core ${effectiveStatus}`}>
+            <span className="agent-orbit-core-mark" aria-hidden="true">
+              {effectiveStatus === "running" ? "↻" : effectiveStatus === "completed" ? "✓" : "·"}
+            </span>
+            <strong>{RUN_STATUS_LABELS[effectiveStatus]}</strong>
+          </div>
+          {AGENT_RING.map((agent) => {
+            const isActive = agent.id === activeAgentId;
+            const hasVisited = visitedAgentIds.has(agent.id);
+            const state =
+              (effectiveStatus === "failed" || effectiveStatus === "cancelled") && isActive
+                ? "failed"
+                : isActive
+                  ? "working"
+                  : hasVisited
+                    ? "done"
+                    : "idle";
+            const activity = latestActivityByAgent.get(agent.id);
+            const summary = isActive
+              ? shortAgentActivity(
+                  (latestMessage?.to_agent === agent.id
+                    ? latestMessage.display_text
+                    : "") ||
+                    activity?.display_text ||
+                    activity?.detail ||
+                    "正在处理任务",
+                )
+              : "";
+            return (
+              <div
+                className={`agent-orbit-node ${agent.position} ${state}`}
+                key={agent.id}
+                aria-label={`${agent.label}：${state === "working" ? summary : state === "done" ? "已完成" : "等待任务"}`}
+              >
+                <span className="agent-orbit-avatar" aria-hidden="true">
+                  <b>{agent.symbol}</b>
+                </span>
+                <strong>{agent.label}</strong>
+                {summary && <small title={activity?.detail || summary}>{summary}</small>}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className={`activity-panel ${compact ? "sidebar-agent-activity" : ""}`}>
@@ -2434,13 +3036,7 @@ function AgentActivity({
             );
           })}
         </div>
-      ) : (
-        !graphEvents.length && (
-          <div className="empty-activity">
-            发起问答、Quiz 或讲义任务后，这里会实时展示 Agent 节点、协作交接与传递摘要。
-          </div>
-        )
-      )}
+      ) : null}
       {!!response && (
         <div className="report-card">
           <h4>质量报告</h4>
@@ -2492,16 +3088,33 @@ function AgentActivity({
   );
 }
 
+function formatQuizHistoryTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "更新时间未知";
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const valueOf = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value || "";
+  return `${valueOf("year")}-${valueOf("month")}-${valueOf("day")} ${valueOf("hour")}:${valueOf("minute")}`;
+}
+
 function QuizView({
   userId,
   busy,
   profile,
   scores,
-  recommendations,
   runAgent,
   sessions,
   activeLecture,
   currentChapterId,
+  currentChapterTitle,
   activeSessionId,
   onActiveSessionChange,
   onSessionChange,
@@ -2512,19 +3125,17 @@ function QuizView({
   busy: boolean;
   profile: LearnerProfile;
   scores: ScoreMap;
-  recommendations: LearningRecommendations;
   runAgent: (request: AgentRequest) => Promise<AgentResponse>;
   sessions: QuizSession[];
   activeLecture: LectureSession | null;
   currentChapterId: string;
+  currentChapterTitle: string;
   activeSessionId: string;
   onActiveSessionChange: (sessionId: string) => void;
   onSessionChange: (session: QuizSession) => void;
   onQuestionSubmitted: (session: QuizSession, questionId: string) => void;
   onFinished: (session: QuizSession) => void | Promise<void>;
 }) {
-  const primaryQuiz = recommendations.quizOptions[0];
-  const [topicOverride, setTopicOverride] = useState<string | null>(null);
   const [count, setCount] = useState(String(DEFAULT_QUIZ_QUESTION_COUNT));
   const [generationProgress, setGenerationProgress] = useState("");
   const generationLock = useRef(false);
@@ -2535,23 +3146,29 @@ function QuizView({
       : profile.level === "intermediate"
         ? "medium"
         : "easy";
-  const [difficultyOverride, setDifficultyOverride] = useState<string | null>(
-    null,
-  );
-  const [focusOverride, setFocusOverride] = useState<string | null>(null);
-  const [linkToCurrentLecture, setLinkToCurrentLecture] = useState(true);
   const [configPanelCollapsed, setConfigPanelCollapsed] = useState(false);
   const [configPanelPeek, setConfigPanelPeek] = useState(false);
   const [configPreferenceReady, setConfigPreferenceReady] = useState(false);
-  const topic = topicOverride ?? primaryQuiz.topic;
-  const difficulty = difficultyOverride ?? recommendedDifficulty;
-  const focus = focusOverride ?? primaryQuiz.focus;
+  const topic = `${currentChapterId} ${currentChapterTitle || "当前学习小节"}`.trim();
+  const difficulty = recommendedDifficulty;
+  const focus = `只考查当前小节“${topic}”的知识目标、核心概念、安全边界与实际应用，不得混入其他小节内容。`;
   const [quizError, setQuizError] = useState<string | null>(null);
   const [panel, setPanel] = useState<"current" | "history">(
     activeSessionId ? "current" : "history",
   );
+  const sectionSessions = useMemo(
+    () =>
+      sessions
+        .filter((session) => session.chapterId === currentChapterId)
+        .sort(
+          (left, right) =>
+            new Date(right.createdAt).getTime() -
+            new Date(left.createdAt).getTime(),
+        ),
+    [currentChapterId, sessions],
+  );
   const activeSession =
-    sessions.find((session) => session.id === activeSessionId) ?? null;
+    sectionSessions.find((session) => session.id === activeSessionId) ?? null;
   const displayedQuizError = quizError || activeSession?.generationError || null;
   const generationRunning =
     !!generationProgress || activeSession?.generationStatus === "generating";
@@ -2603,18 +3220,16 @@ function QuizView({
       const responses: AgentResponse[] = [];
       const nextQuestions: QuizQuestion[] = [];
       const sessionId = uid("quiz-session");
-      const requestChapterId =
-        linkToCurrentLecture && activeLecture
-          ? activeLecture.chapterId
-          : currentChapterId;
+      const requestChapterId = currentChapterId;
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
         const batch = batches[batchIndex];
         setGenerationProgress(
           `正在生成第 ${batchIndex + 1}/${batches.length} 批 · 已完成 ${nextQuestions.length}/${blueprint.length} 题`,
         );
         const prompt = [
-          `围绕“${topic}”生成本批 ${batch.length} 道岗位培训题，重点考查：${focus}。`,
+          `严格围绕当前小节“${topic}”生成本批 ${batch.length} 道岗位培训题，重点考查：${focus}。`,
           `这是总计 ${blueprint.length} 道题中的第 ${batchIndex + 1}/${batches.length} 批。`,
+          `知识范围已锁定为章节 ${requestChapterId}。不得生成其他章节或小节的题目；如果检索证据不足，应明确报错，不得用其他小节内容补齐。`,
           "必须依据本次 RAG 证据，严格逐项执行下面的 JSON 蓝图；返回顺序与蓝图一致，不得少题、换题型、换能力维度或修改分值。",
           "题型按 single_choice、true_false、cloze、short_answer 分区生成。判断题题干必须是可判断真假的完整陈述句，只提供“正确/错误”两个选项，answer 必须为 A（正确）或 B（错误）。主观题必须返回 reference_answer 与 scoring_rubric.key_points。所有题返回内容有明确差异的简洁解析和详细解析。",
           `QUIZ_BLUEPRINT=${JSON.stringify(batch)}`,
@@ -2681,7 +3296,7 @@ function QuizView({
           questions: nextQuestions,
           response: partialResponse,
           assessmentLink:
-            linkToCurrentLecture && activeLecture
+            activeLecture && activeLecture.chapterId === requestChapterId
               ? {
                   lectureId: activeLecture.id,
                   chapterId: activeLecture.chapterId,
@@ -2795,13 +3410,15 @@ function QuizView({
       <div className="section-container quiz-section-container">
         <div className="section-intro">
           <div>
-            <h2>生成个性化 Quiz</h2>
-            <p>
-              配置测验目标后，前端会以 content_type=quiz
-              向中央调度器发起请求。题目、作答进度和知识来源会自动保存。
-            </p>
+            <h2>当前小节 Quiz</h2>
+            <div className="page-learning-context" aria-label="当前 Quiz 学习小节">
+              <span>当前小节</span>
+              <strong>
+                {currentChapterId} {currentChapterTitle || "当前学习内容"}
+              </strong>
+            </div>
           </div>
-          <span className="orchestrator-badge">画像水平 · {profile.level}</span>
+          <span className="orchestrator-badge">知识范围已锁定</span>
         </div>
         <div
           className={`quiz-grid ${configPanelCollapsed ? "config-panel-collapsed" : ""}`}
@@ -2816,8 +3433,8 @@ function QuizView({
           >
             <div className="config-card-header">
               <div>
-                <span className="eyebrow">个性化测验</span>
-                <h3 className="card-title">生成设置</h3>
+                <span className="eyebrow">{currentChapterId} · 本节题库</span>
+                <h3 className="card-title">题库设置</h3>
               </div>
               <div className="config-card-actions">
                 <span className="config-count-chip">{blueprintSummary.total} 题</span>
@@ -2843,100 +3460,31 @@ function QuizView({
                 </button>
               </div>
             </div>
+            <div className="quiz-section-lock">
+              <span>本次出题范围</span>
+              <strong>{topic}</strong>
+            </div>
             <div className="form-field">
-              <label htmlFor="quiz-topic">主题或知识点</label>
+              <label htmlFor="quiz-count">题目数量</label>
               <input
-                id="quiz-topic"
+                type="number"
+                id="quiz-count"
                 className="input"
-                value={topic}
-                onChange={(event) => {
-                  setTopicOverride(event.target.value);
-                }}
-              />
-            </div>
-            {activeLecture && (
-              <label className="assessment-link-toggle">
-                <input
-                  type="checkbox"
-                  checked={linkToCurrentLecture}
-                  onChange={(event) => setLinkToCurrentLecture(event.target.checked)}
-                />
-                <span>
-                  <strong>用于评估当前讲义</strong>
-                  <small>
-                    精确关联 {activeLecture.chapterId}「{activeLecture.title}」；只有关联后的作答才更新该讲义掌握度。
-                  </small>
-                </span>
-              </label>
-            )}
-            <div className="quiz-recommendations">
-              <div className="quiz-recommendations-head">
-                <span>Memory 推荐主题</span>
-              </div>
-              <div className="quiz-recommendation-list">
-                {recommendations.quizOptions.map((option) => (
-                  <button
-                    type="button"
-                    key={option.id}
-                    className={`quiz-recommendation-chip ${
-                      topic === option.topic ? "active" : ""
-                    }`}
-                    title={option.reason}
-                    onClick={() => {
-                      setTopicOverride(option.topic);
-                      setFocusOverride(option.focus);
-                    }}
-                  >
-                    <strong>{option.topic}</strong>
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="quiz-compact-fields">
-              <div className="form-field">
-                <label htmlFor="quiz-count">题目数量</label>
-                <input
-                  type="number"
-                  id="quiz-count"
-                  className="input"
-                  min={MIN_QUIZ_QUESTION_COUNT}
-                  max={MAX_QUIZ_QUESTION_COUNT}
-                  value={count}
-                  onChange={(event) => setCount(event.target.value)}
-                  onBlur={() => setCount(String(normalizeQuizCount(count)))}
-                />
-              </div>
-              <div className="form-field">
-                <label htmlFor="quiz-difficulty">难度</label>
-                <select
-                  id="quiz-difficulty"
-                  className="select"
-                  value={difficulty}
-                  onChange={(event) => setDifficultyOverride(event.target.value)}
-                >
-                  <option value="easy">基础</option>
-                  <option value="medium">中等</option>
-                  <option value="hard">进阶</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-field">
-              <label htmlFor="quiz-focus">考查重点（可选）</label>
-              <textarea
-                id="quiz-focus"
-                className="input"
-                value={focus}
-                onChange={(event) => {
-                  setFocusOverride(event.target.value);
-                }}
+                min={MIN_QUIZ_QUESTION_COUNT}
+                max={MAX_QUIZ_QUESTION_COUNT}
+                value={count}
+                onChange={(event) => setCount(event.target.value)}
+                onBlur={() => setCount(String(normalizeQuizCount(count)))}
               />
             </div>
             <div className="quiz-config-footer">
-              <span>自动覆盖四类题型与八维岗位能力</span>
+              <span>
+                难度按画像自动匹配 · {difficulty === "hard" ? "进阶" : difficulty === "medium" ? "中等" : "基础"}
+              </span>
               <button
                 type="submit"
                 className="primary-button quiz-generate-button"
-                disabled={busy || generationRunning || !topic.trim()}
+                disabled={busy || generationRunning}
                 data-testid="quiz-generate"
               >
                 {generationProgress ||
@@ -2944,7 +3492,7 @@ function QuizView({
                     ? "题目正在生成…"
                     : busy
                       ? "中央调度器处理中…"
-                      : `生成 ${blueprintSummary.total} 题 Quiz →`)}
+                      : `${sectionSessions.length ? "再次生成" : "生成"} ${blueprintSummary.total} 题 →`)}
               </button>
             </div>
           </form>
@@ -2983,12 +3531,14 @@ function QuizView({
                 className={panel === "history" ? "active" : ""}
                 onClick={() => setPanel("history")}
               >
-                历史记录 <span>{sessions.length}</span>
+                本节历史 <span>{sectionSessions.length}</span>
               </button>
             </div>
             {panel === "history" ? (
               <QuizHistoryPanel
-                sessions={sessions}
+                sessions={sectionSessions}
+                chapterId={currentChapterId}
+                chapterTitle={currentChapterTitle}
                 onOpen={(sessionId) => {
                   onActiveSessionChange(sessionId);
                   setPanel("current");
@@ -3016,7 +3566,7 @@ function QuizView({
                       (generationRunning
                         ? `已生成 ${activeSession?.questions.length || 0}/${activeSession?.expectedQuestionCount || blueprint.length} 题，正在继续生成…`
                         : "") ||
-                      "完成左侧设置并生成 Quiz。生成后会立即保存，刷新页面也能继续作答。"}
+                      "选择题目数量后生成本小节题库。生成后会立即保存，刷新页面也能继续作答。"}
                   </p>
                 </div>
               </div>
@@ -3250,16 +3800,19 @@ function QuizView({
 
 function QuizHistoryPanel({
   sessions,
+  chapterId,
+  chapterTitle,
   onOpen,
 }: {
   sessions: QuizSession[];
+  chapterId: string;
+  chapterTitle: string;
   onOpen: (sessionId: string) => void;
 }) {
   if (!sessions.length) {
     return (
       <div className="quiz-history-empty">
-        <span>暂无 Quiz 记录</span>
-        <p>新生成的题目会在后端返回后立即保存，未完成的测验也可以继续。</p>
+        <span>{chapterId} 暂无题库记录</span>
       </div>
     );
   }
@@ -3268,27 +3821,19 @@ function QuizHistoryPanel({
     <div className="quiz-history-panel">
       <div className="quiz-history-heading">
         <div>
-          <strong>Quiz 历史</strong>
-          <p>保留最近 50 次测验的题目、答案、解析和知识来源。</p>
+          <strong>{chapterId} {chapterTitle || "当前小节"} · 题库历史</strong>
         </div>
       </div>
       <div className="quiz-history-list">
-        {sessions.map((session) => {
+        {sessions.map((session, index) => {
           const progress = quizSessionProgress(session);
-          const createdAt = new Date(session.createdAt);
-          const dateLabel = Number.isFinite(createdAt.getTime())
-            ? createdAt.toLocaleString("zh-CN", {
-                month: "2-digit",
-                day: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit",
-              })
-            : session.createdAt;
+          const versionNumber = sessions.length - index;
+          const dateLabel = formatQuizHistoryTimestamp(session.createdAt);
           return (
             <article className="quiz-history-item" key={session.id}>
               <div className="quiz-history-item-main">
                 <div className="quiz-history-title-row">
-                  <strong>{session.topic}</strong>
+                  <strong>第 {versionNumber} 套题库</strong>
                   <span className={`quiz-session-status ${session.status}`}>
                     {session.status === "completed"
                       ? "已完成"
@@ -3297,7 +3842,7 @@ function QuizHistoryPanel({
                         : "进行中"}
                   </span>
                 </div>
-                <p>{session.focus || "综合知识测验"}</p>
+                <p>{session.chapterId} · {session.questions.length} 道本节练习题</p>
                 <div className="quiz-history-meta">
                   <span>{dateLabel}</span>
                   <span>
@@ -3408,6 +3953,23 @@ function nextBackendLearningPathChapter(
     : null;
 }
 
+function formatLectureHistoryTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "更新时间未知";
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const valueOf = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value || "";
+  return `${valueOf("year")}-${valueOf("month")}-${valueOf("day")} ${valueOf("hour")}:${valueOf("minute")}`;
+}
+
 function LectureView({
   userId,
   sessions,
@@ -3418,6 +3980,7 @@ function LectureView({
   scores,
   progress,
   learningPath,
+  sectionContextId,
   capabilityEvidence,
   busy,
   runAgent,
@@ -3432,13 +3995,13 @@ function LectureView({
   scores: ScoreMap;
   progress: LearningProgressResult;
   learningPath: UserLearningPath | null;
+  sectionContextId: string;
   capabilityEvidence: CapabilityEvidence[];
   busy: boolean;
   runAgent: (request: AgentRequest) => Promise<AgentResponse>;
   onProgressChanged: () => void | Promise<void>;
 }) {
   const [lectureError, setLectureError] = useState("");
-  const [confirmNext, setConfirmNext] = useState(false);
   const [generationState, setGenerationState] = useState<{
     reason: LectureGenerationReason;
     chapterId: string;
@@ -3465,31 +4028,27 @@ function LectureView({
         : sessions,
     [backendChaptersById, hasBackendPath, sessions],
   );
-  const legacySessions = useMemo(
-    () =>
-      hasBackendPath
-        ? sessions.filter(
-            (session) =>
-              backendChaptersById.get(session.chapterId) !==
-              session.chapterTitle.trim(),
-          )
-        : [],
-    [backendChaptersById, hasBackendPath, sessions],
-  );
   const currentChapterId =
+    sectionContextId ||
     learningPath?.current_chapter_id ||
     progress.currentChapterId ||
     ACTIVE_CHAPTER_ID;
-  const currentPathChapter = learningPath?.chapters.find(
-    (chapter) => chapter.chapter_id === currentChapterId,
+  const sectionSessions = useMemo(
+    () =>
+      validSessions.filter(
+        (session) => session.chapterId === currentChapterId,
+      ),
+    [currentChapterId, validSessions],
   );
-  const selectedLecture = validSessions.find(
+  const selectedLecture = sectionSessions.find(
     (session) => session.id === activeSessionId,
   );
-  const currentChapterLecture = validSessions.find(
-    (session) => session.chapterId === currentChapterId,
-  );
+  const currentChapterLecture = sectionSessions[0];
   const activeLecture = selectedLecture ?? currentChapterLecture ?? null;
+  const activeLectureVersion = activeLecture
+    ? sectionSessions.length -
+      sectionSessions.findIndex((session) => session.id === activeLecture.id)
+    : null;
   const lectureGenerating = generationState !== null;
 
   useEffect(() => {
@@ -3503,10 +4062,6 @@ function LectureView({
         : null,
     [activeLecture, capabilityEvidence],
   );
-  const nextChapter = activeLecture
-    ? nextBackendLearningPathChapter(learningPath, activeLecture.chapterId)
-    : null;
-
   async function requestLecture(
     reason: LectureGenerationReason,
     chapterId: string,
@@ -3614,32 +4169,23 @@ function LectureView({
     }
   }
 
-  function requestNextStage() {
-    if (!activeLecture || !nextChapter || busy || lectureGenerating) return;
-    if (!mastery?.recommendedForNextStage) {
-      setConfirmNext(true);
-      return;
-    }
-    void generate("next_stage", activeLecture.chapterId, activeLecture);
-  }
-
   return (
     <div className="lecture-page">
       <aside className="lecture-library card">
         <div className="lecture-library-head">
           <div>
-            <h2>讲义记录</h2>
-            <p>已生成的讲义会自动保存</p>
+            <h2>本节讲义记录</h2>
           </div>
-          <span>{validSessions.length}</span>
+          <span>{sectionSessions.length}</span>
         </div>
         <div className="lecture-history-list">
-          {validSessions.length ? (
-            validSessions.map((lecture) => {
+          {sectionSessions.length ? (
+            sectionSessions.map((lecture, index) => {
               const itemMastery = calculateLectureMastery(
                 lecture,
                 capabilityEvidence,
               );
+              const versionNumber = sectionSessions.length - index;
               return (
                 <button
                   type="button"
@@ -3647,8 +4193,14 @@ function LectureView({
                   key={lecture.id}
                   onClick={() => onActiveSessionChange(lecture.id)}
                 >
-                  <span className="lecture-history-chapter">{lecture.chapterId}</span>
-                  <strong>{lecture.title}</strong>
+                  <span className="lecture-history-chapter">第 {versionNumber} 版</span>
+                  <strong>第 {versionNumber} 版讲义</strong>
+                  <time
+                    className="lecture-history-time"
+                    dateTime={lecture.createdAt}
+                  >
+                    {formatLectureHistoryTimestamp(lecture.createdAt)}
+                  </time>
                   <small>
                     {itemMastery.status === "mastered"
                       ? "已掌握"
@@ -3662,11 +4214,8 @@ function LectureView({
               );
             })
           ) : (
-            <div className="lecture-history-empty">生成第一份讲义后，这里会形成个人讲义库。</div>
-          )}
-          {legacySessions.length > 0 && (
-            <div className="lecture-legacy-note">
-              已保留并隐藏 {legacySessions.length} 条旧目录讲义，避免其干扰当前学习路径。
+            <div className="lecture-history-empty">
+              暂无讲义
             </div>
           )}
         </div>
@@ -3677,12 +4226,6 @@ function LectureView({
           <div className="lecture-empty">
             <span>学</span>
             <h2>从当前阶段开始学习</h2>
-            <p>
-              知链将依据你的 Memory、岗位学习进度和 RAG 知识库，生成章节
-              {currentChapterId}「
-              {currentPathChapter?.chapter_title || progress.currentChapterTitle}
-              」讲义。
-            </p>
             <button
               type="button"
               className="primary-button"
@@ -3691,7 +4234,7 @@ function LectureView({
                 void generate("initial", currentChapterId, null)
               }
             >
-              {lectureGenerating ? "中央调度器生成中…" : "生成当前阶段讲义"}
+              {lectureGenerating ? "中央调度器生成中…" : "生成本小节讲义"}
             </button>
             {lectureGenerating && (
               <p className="lecture-generation-status">
@@ -3707,6 +4250,10 @@ function LectureView({
                 <div className="lecture-meta-row">
                   <span>章节 {activeLecture.chapterId}</span>
                   <span>{activeLecture.chapterTitle}</span>
+                  {activeLectureVersion !== null && (
+                    <span>第 {activeLectureVersion} 版</span>
+                  )}
+                  <span>{formatLectureHistoryTimestamp(activeLecture.createdAt)}</span>
                   <span>{activeLecture.sourceRefs.length} 个知识来源</span>
                 </div>
                 <h2>{activeLecture.title}</h2>
@@ -3728,18 +4275,6 @@ function LectureView({
                   {generationState?.reason === "regenerate"
                     ? "正在重新生成…"
                     : "重新生成"}
-                </button>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busy || lectureGenerating || !nextChapter}
-                  onClick={requestNextStage}
-                >
-                  {generationState?.reason === "next_stage"
-                    ? "正在生成下阶段…"
-                    : nextChapter
-                      ? "生成下阶段讲义"
-                      : "已是最后阶段"}
                 </button>
                 {lectureGenerating && (
                   <p className="lecture-generation-status">
@@ -3807,37 +4342,6 @@ function LectureView({
         )}
       </section>
 
-      {confirmNext && activeLecture && nextChapter && (
-        <div className="confirmation-backdrop" role="presentation" onMouseDown={() => setConfirmNext(false)}>
-          <div
-            className="confirmation-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="lecture-confirm-title"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <span className="confirmation-symbol">!</span>
-            <h2 id="lecture-confirm-title">当前知识尚未达到推荐掌握度</h2>
-            <p>
-              {mastery?.message}。如果继续，将进入章节 {nextChapter.id}「{nextChapter.title}」，
-              当前讲义仍会保留在历史记录中。
-            </p>
-            <div className="confirmation-actions">
-              <button type="button" onClick={() => setConfirmNext(false)}>继续巩固</button>
-              <button
-                type="button"
-                className="danger-confirm"
-                onClick={() => {
-                  setConfirmNext(false);
-                  void generate("next_stage", activeLecture.chapterId, activeLecture);
-                }}
-              >
-                仍然生成下阶段讲义
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -4236,24 +4740,69 @@ function MoreInfoDrawer({
   );
 }
 
+const CURRICULUM_CHAPTER_META: Record<
+  string,
+  { title: string; summary: string }
+> = {
+  "1": {
+    title: "数控车床基础认知",
+    summary: "认识机床结构、工作原理与常见类型，建立完整的基础概念框架。",
+  },
+  "2": {
+    title: "上机安全基础",
+    summary: "掌握着装、设备检查、异常处理与加工前后的安全要求。",
+  },
+  "3": {
+    title: "数控车床基本操作",
+    summary: "从开关机、装夹和对刀开始，逐步掌握数控系统的基本操作。",
+  },
+  "4": {
+    title: "CNC 代码练习与仿真",
+    summary: "理解程序结构与常用指令，通过编程练习和路径校验建立加工能力。",
+  },
+  "5": {
+    title: "上机测试与结果审查",
+    summary: "完成典型零件加工测试，并对尺寸、质量与加工结果进行复核。",
+  },
+};
+
 function LearningProgressView({
+  userId,
   progress,
   learningPath,
   learningPathLoading,
   learningPathError,
   onNavigate,
+  busy,
+  onAdvance,
 }: {
+  userId: string;
   progress: LearningProgressResult;
   learningPath: UserLearningPath | null;
   learningPathLoading: boolean;
   learningPathError: string;
-  onNavigate: (view: View) => void;
+  onNavigate: (
+    view: Extract<View, "chat" | "quiz" | "lecture">,
+    sectionId: string,
+  ) => void;
+  busy: boolean;
+  onAdvance: (sectionId: string, force: boolean) => Promise<string>;
 }) {
   const [detailPanel, setDetailPanel] = useState<"gates" | "dimensions" | null>(
     null,
   );
-  const [expandedChapterId, setExpandedChapterId] = useState("");
+  const [expandedChapterId, setExpandedChapterId] = useState<string | null>(
+    null,
+  );
   const [selectedSectionId, setSelectedSectionId] = useState("");
+  const [sectionReadiness, setSectionReadiness] =
+    useState<LearningSectionReadiness | null>(null);
+  const [readinessLoadingFor, setReadinessLoadingFor] = useState("");
+  const [readinessError, setReadinessError] = useState("");
+  const [advanceDialogOpen, setAdvanceDialogOpen] = useState(false);
+  const [advanceBusy, setAdvanceBusy] = useState(false);
+  const [advanceError, setAdvanceError] = useState("");
+  const readinessRequestId = useRef(0);
 
   const pathChapters = useMemo(
     () => learningPath?.chapters ?? [],
@@ -4267,13 +4816,18 @@ function LearningProgressView({
       chapters.push(chapter);
       groups.set(groupNumber, chapters);
     }
-    return Array.from(groups.entries()).map(([groupNumber, chapters]) => ({
-      id: `chapter_${groupNumber.padStart(2, "0")}`,
-      number: groupNumber,
-      title: `Chapter ${groupNumber} · ${chapters[0]?.chapter_id}–${chapters.at(-1)?.chapter_id}`,
-      summary: `${chapters.length} 个后端课程章节`,
-      chapters,
-    }));
+    return Array.from(groups.entries()).map(([groupNumber, chapters]) => {
+      const meta = CURRICULUM_CHAPTER_META[groupNumber];
+      return {
+        id: `chapter_${groupNumber.padStart(2, "0")}`,
+        number: groupNumber,
+        title: meta?.title || `第 ${groupNumber} 章`,
+        summary:
+          meta?.summary ||
+          `${chapters[0]?.chapter_id}–${chapters.at(-1)?.chapter_id} 学习内容`,
+        chapters,
+      };
+    });
   }, [pathChapters]);
 
   const progressByChapterId = useMemo(
@@ -4290,9 +4844,6 @@ function LearningProgressView({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [detailPanel]);
 
-  const currentStageIndex = ["l1", "l2", "l3", "job_ready"].indexOf(
-    progress.currentStageId,
-  );
   const gateRadarItems = stageGateRadarItems(progress.gates);
   const dimensionRadarItems: RadarMetric[] = progress.dimensions.map(
     (dimension) => ({
@@ -4309,31 +4860,122 @@ function LearningProgressView({
   );
   const passedGateCount = progress.gates.filter((gate) => gate.passed).length;
   const quickActions: Array<{
-    view: Exclude<View, "progress">;
+    view: Extract<View, "chat" | "quiz" | "lecture">;
     symbol: string;
     label: string;
   }> = [
-    { view: "chat", symbol: "问", label: "聊天问答" },
-    { view: "quiz", symbol: "测", label: "Quiz 生成" },
-    { view: "lecture", symbol: "学", label: "学习讲义" },
-    { view: "memory", symbol: "人", label: "用户中心" },
+    { view: "quiz", symbol: "测", label: "本节 Quiz" },
+    { view: "lecture", symbol: "学", label: "本节讲义" },
+    { view: "chat", symbol: "问", label: "本节问答" },
   ];
   const currentPathChapter =
     pathChapters.find(
       (chapter) => chapter.chapter_id === learningPath?.current_chapter_id,
     ) ?? pathChapters[0];
+  const nextPathChapter = pathChapters.find(
+    (chapter) => chapter.chapter_id === currentPathChapter?.next_chapter_id,
+  );
   const selectedSection =
     pathChapters.find((chapter) => chapter.chapter_id === selectedSectionId) ??
     currentPathChapter;
-  const activeCurriculumChapter =
-    curriculumGroups.find((group) => group.id === expandedChapterId) ??
+  const defaultCurriculumChapter =
     curriculumGroups.find((group) =>
       group.chapters.some(
         (chapter) => chapter.chapter_id === selectedSection?.chapter_id,
       ),
     ) ?? curriculumGroups[0];
-  const effectiveExpandedChapterId = activeCurriculumChapter?.id ?? "";
+  const effectiveExpandedChapterId =
+    expandedChapterId === null
+      ? defaultCurriculumChapter?.id ?? ""
+      : expandedChapterId;
   const effectiveSelectedSectionId = selectedSection?.chapter_id ?? "";
+  const currentSectionReadiness =
+    sectionReadiness?.chapter_id === currentPathChapter?.chapter_id
+      ? sectionReadiness
+      : null;
+  const readinessLoading =
+    !!currentPathChapter && readinessLoadingFor === currentPathChapter.chapter_id;
+  const readinessPassed = currentSectionReadiness?.can_advance === true;
+  const readinessBlockers = readinessBlockerMessages(currentSectionReadiness);
+
+  useEffect(() => {
+    if (!userId || !currentPathChapter?.chapter_id || !nextPathChapter?.chapter_id) {
+      return;
+    }
+
+    let cancelled = false;
+    const requestId = readinessRequestId.current + 1;
+    readinessRequestId.current = requestId;
+    const chapterId = currentPathChapter.chapter_id;
+    const courseId = learningPath?.course_id || ACTIVE_COURSE_ID;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setReadinessLoadingFor(chapterId);
+      setReadinessError("");
+      void evaluateLearningSectionReadiness({ userId, courseId, chapterId })
+        .then((result) => {
+          if (!cancelled && readinessRequestId.current === requestId) {
+            setSectionReadiness(result);
+          }
+        })
+        .catch((error) => {
+          if (cancelled || readinessRequestId.current !== requestId) return;
+          setSectionReadiness(null);
+          setReadinessError(
+            error instanceof Error ? error.message : "暂时无法评估当前小节",
+          );
+        })
+        .finally(() => {
+          if (!cancelled && readinessRequestId.current === requestId) {
+            setReadinessLoadingFor("");
+          }
+        });
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    currentPathChapter?.chapter_id,
+    learningPath?.course_id,
+    nextPathChapter?.chapter_id,
+    userId,
+  ]);
+
+  useEffect(() => {
+    if (!advanceDialogOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !advanceBusy) setAdvanceDialogOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [advanceBusy, advanceDialogOpen]);
+
+  async function confirmSectionAdvance() {
+    if (!currentPathChapter || !nextPathChapter || advanceBusy || busy) return;
+    setAdvanceBusy(true);
+    setAdvanceError("");
+    try {
+      const targetSectionId = await onAdvance(
+        currentPathChapter.chapter_id,
+        !readinessPassed,
+      );
+      const targetGroup = curriculumGroups.find((group) =>
+        group.chapters.some((chapter) => chapter.chapter_id === targetSectionId),
+      );
+      setSelectedSectionId(targetSectionId);
+      if (targetGroup) setExpandedChapterId(targetGroup.id);
+      setAdvanceDialogOpen(false);
+      setSectionReadiness(null);
+    } catch (error) {
+      setAdvanceError(
+        error instanceof Error ? error.message : "进入下一小节失败",
+      );
+    } finally {
+      setAdvanceBusy(false);
+    }
+  }
 
   const sectionLearningStatus = (sectionId: string) => {
     const chapterProgress = progressByChapterId.get(sectionId);
@@ -4364,17 +5006,11 @@ function LearningProgressView({
       <main className="progress-surface">
         <section className="progress-dashboard" aria-label="学习进度总览">
           <div className="progress-dashboard-copy">
-            <span className="eyebrow">
-              {learningPathLoading
-                ? "正在读取后端学习路径"
-                : `当前学习路径 · ${learningPath?.path_title || progress.currentStageLabel}`}
-            </span>
             <h2>
               {currentPathChapter
                 ? `${currentPathChapter.chapter_id} ${currentPathChapter.chapter_title}`
                 : `${progress.currentChapterId} ${progress.currentChapterTitle}`}
             </h2>
-            <p>{currentPathChapter?.focus.summary || progress.currentStageOutcome}</p>
             <div className="progress-dashboard-metrics" aria-label="核心学习指标">
               <div><strong>{progress.courseCompletion}%</strong><span>课程完成</span></div>
               <div><strong>{progress.provisionalMastery}</strong><span>能力暂估</span></div>
@@ -4392,28 +5028,6 @@ function LearningProgressView({
           </div>
         </section>
 
-        <section className="progress-stage-strip" aria-labelledby="progress-stage-title">
-          <div className="progress-stage-heading">
-            <div>
-              <h3 id="progress-stage-title">岗位成长阶段</h3>
-              <p>阶段表示“能力到哪里”，与下方 Chapter 知识目录分开计算。</p>
-            </div>
-            <span>模型 {progress.modelVersion}</span>
-          </div>
-          <div className="progress-stage-track">
-            {COURSE_PHASES.map((phase, index) => {
-              const completed = index === 0 || index < currentStageIndex + 1;
-              const active = phase.id === progress.currentStageId;
-              return (
-                <div className={`progress-stage-item ${completed ? "completed" : ""} ${active ? "active" : ""}`} key={phase.id}>
-                  <span>{completed ? "✓" : index + 1}</span>
-                  <div><strong>{phase.label}</strong><small>{phase.range}</small></div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
         <section className="progress-curriculum" aria-labelledby="curriculum-title">
           <div className="progress-curriculum-heading">
             <div>
@@ -4423,13 +5037,11 @@ function LearningProgressView({
                   : "后端真实课程目录"}
               </span>
               <h2 id="curriculum-title">{learningPath?.path_title || "课程学习地图"}</h2>
-              <p>
-                {learningPath?.assignment?.classification_reason ||
-                  "目录、章节顺序与学习状态均由当前用户的后端学习路径提供。"}
-              </p>
             </div>
             <span className="curriculum-count">
-              {learningPathLoading ? "读取中" : `${pathChapters.length} 个章节`}
+              {learningPathLoading
+                ? "读取中"
+                : `${curriculumGroups.length} 个 Chapter · ${pathChapters.length} 个小节`}
             </span>
           </div>
 
@@ -4437,14 +5049,14 @@ function LearningProgressView({
             <div className="progress-curriculum-state" role="status">
               正在读取后端分配路径、课程目录与章节进度…
             </div>
-          ) : learningPathError || !learningPath || !pathChapters.length || !selectedSection || !activeCurriculumChapter ? (
+          ) : learningPathError || !learningPath || !pathChapters.length || !currentPathChapter || !selectedSection || !defaultCurriculumChapter ? (
             <div className="progress-curriculum-state error" role="alert">
               <strong>暂时无法读取后端真实学习路径</strong>
               <span>{learningPathError || "后端没有返回可用章节。"}</span>
             </div>
           ) : (
           <div className="progress-curriculum-layout">
-            <div className="chapter-accordion">
+            <div className="progress-course-path" aria-label="课程章节与小节学习路径">
               {curriculumGroups.map((chapter) => {
                 const active = effectiveExpandedChapterId === chapter.id;
                 const completedCount = chapter.chapters.filter(
@@ -4459,106 +5071,135 @@ function LearningProgressView({
                     <button
                       type="button"
                       className="chapter-accordion-trigger"
-                      aria-pressed={active}
-                      onClick={() =>
+                      aria-expanded={active}
+                      aria-controls={`curriculum-${chapter.id}`}
+                      onClick={() => {
+                        if (active) {
+                          setExpandedChapterId("");
+                          return;
+                        }
                         selectCurriculumSection(
                           chapter.id,
                           chapter.chapters.find(
                             (section) => ["current", "review"].includes(sectionLearningStatus(section.chapter_id)),
                           )?.chapter_id ?? chapter.chapters[0].chapter_id,
-                        )
-                      }
+                        );
+                      }}
                     >
-                      <span className={`chapter-number ${chapterDone ? "completed" : hasCurrent ? "current" : ""}`}>
-                        {chapterDone ? "✓" : chapter.number}
+                      <span
+                        className={`chapter-completion-switch ${chapterDone ? "completed" : ""}`}
+                        aria-hidden="true"
+                      >
+                        <i>{chapterDone ? "✓" : chapter.number}</i>
                       </span>
                       <span className="chapter-trigger-copy">
-                        <strong>{chapter.title}</strong>
-                        <small>{chapter.summary}</small>
+                        <strong>Chapter {chapter.number} · {chapter.title}</strong>
                       </span>
                       <span className="chapter-progress-label">
-                        {completedCount}/{chapter.chapters.length}
-                        <i>›</i>
+                        <b>{completedCount}/{chapter.chapters.length} 小节</b>
+                        <i aria-hidden="true">{active ? "▾" : "▸"}</i>
                       </span>
                     </button>
+
+                    {active && (
+                      <div
+                        className="chapter-section-list"
+                        id={`curriculum-${chapter.id}`}
+                        role="region"
+                        aria-label={`Chapter ${chapter.number} ${chapter.title}的小节`}
+                      >
+                        {chapter.chapters.map((section) => {
+                          const status = sectionLearningStatus(section.chapter_id);
+                          const selected = section.chapter_id === effectiveSelectedSectionId;
+                          const actionsOpen = selected && status !== "upcoming";
+                          return (
+                            <div
+                              className={`chapter-section-entry ${actionsOpen ? "actions-open" : ""}`}
+                              key={section.chapter_id}
+                            >
+                              <button
+                                type="button"
+                                className={`chapter-section-row ${status} ${selected ? "selected" : ""}`}
+                                onClick={() => selectCurriculumSection(chapter.id, section.chapter_id)}
+                                aria-current={status === "current" ? "step" : undefined}
+                              >
+                                <span className="section-index">{section.chapter_id}</span>
+                                <span className="section-status-dot" aria-hidden="true">
+                                  {status === "completed" ? "✓" : ""}
+                                </span>
+                                <span className="section-row-copy">
+                                  <strong>{section.chapter_title}</strong>
+                                </span>
+                                <em>
+                                  {status === "completed"
+                                    ? "已完成"
+                                    : status === "review"
+                                      ? "需要复习"
+                                      : status === "current"
+                                        ? "学习中"
+                                        : "未开始"}
+                                </em>
+                              </button>
+                              {actionsOpen && (
+                                <div
+                                  className="section-learning-actions"
+                                  aria-label={`${section.chapter_id} ${section.chapter_title}的学习入口`}
+                                >
+                                  {quickActions.map((action) => (
+                                    <button
+                                      type="button"
+                                      className={action.view}
+                                      key={action.view}
+                                      onClick={() =>
+                                        onNavigate(action.view, section.chapter_id)
+                                      }
+                                    >
+                                      <span>{action.symbol}</span>
+                                      <strong>{action.label}</strong>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </article>
                 );
               })}
             </div>
 
-            <div className="chapter-section-browser" aria-label={`${activeCurriculumChapter.title}小节`}>
-              <header>
-                <span>后端目录分组</span>
-                <strong>{activeCurriculumChapter.title}</strong>
-                <small>{activeCurriculumChapter.chapters.length} 个章节</small>
-              </header>
-              <div className="chapter-section-list">
-                {activeCurriculumChapter.chapters.map((section) => {
-                  const status = sectionLearningStatus(section.chapter_id);
-                  const selected = section.chapter_id === effectiveSelectedSectionId;
-                  return (
+            <aside className="progress-next-panel" aria-label="当前小节与下一步操作">
+              <span className="eyebrow">当前小节</span>
+              <h3>
+                {currentPathChapter.chapter_id} {currentPathChapter.chapter_title}
+              </h3>
+              {nextPathChapter && (
+                  <section
+                    className={`section-advance-card ${readinessPassed ? "ready" : "blocked"} ${readinessError ? "unavailable" : ""}`}
+                    aria-label="进入下一小节"
+                  >
                     <button
                       type="button"
-                      className={`chapter-section-row ${status} ${selected ? "selected" : ""}`}
-                      key={section.chapter_id}
-                      onClick={() => selectCurriculumSection(activeCurriculumChapter.id, section.chapter_id)}
+                      className="section-advance-button"
+                      disabled={
+                        readinessLoading ||
+                        !!readinessError ||
+                        busy ||
+                        advanceBusy
+                      }
+                      onClick={() => {
+                        setAdvanceError("");
+                        setAdvanceDialogOpen(true);
+                      }}
                     >
-                      <span className="section-status-dot">{status === "completed" ? "✓" : ""}</span>
-                      <span>
-                        <strong>{section.chapter_id} {section.chapter_title}</strong>
-                        <small>{section.focus.summary}</small>
-                      </span>
-                      <em>
-                        {status === "completed"
-                          ? "已完成"
-                          : status === "review"
-                            ? "需要复习"
-                            : status === "current"
-                              ? "学习中"
-                              : "未开始"}
-                      </em>
+                      {readinessLoading
+                        ? "正在评估本节掌握情况…"
+                        : "进入下一小节"}
                     </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <aside className="progress-next-panel" aria-label="当前小节与下一步操作">
-              <span className="eyebrow">已选择知识点</span>
-              <h3>{selectedSection.chapter_id} {selectedSection.chapter_title}</h3>
-              <p>{selectedSection.focus.summary}</p>
-              <div className="selected-section-context">
-                <span>顺序 {selectedSection.chapter_order}</span>
-                <span className={sectionLearningStatus(selectedSection.chapter_id)}>
-                  {sectionLearningStatus(selectedSection.chapter_id) === "completed"
-                    ? "已完成"
-                    : sectionLearningStatus(selectedSection.chapter_id) === "review"
-                      ? "需要复习"
-                      : sectionLearningStatus(selectedSection.chapter_id) === "current"
-                        ? "当前学习"
-                        : "待学习"}
-                </span>
-              </div>
-              <div className="selected-section-materials" aria-label="必需学习材料">
-                {selectedSection.required_material_types.map((materialType) => (
-                  <span key={materialType}>{learningMaterialLabel(materialType)}</span>
-                ))}
-              </div>
-              {selectedSection.next_chapter_id && (
-                <small className="selected-section-next">
-                  下一章节：{selectedSection.next_chapter_id}
-                </small>
-              )}
-              <div className="progress-next-actions">
-                {quickActions.map((action) => (
-                  <button type="button" key={action.view} onClick={() => onNavigate(action.view)}>
-                    <span>{action.symbol}</span>
-                    <strong>{action.label}</strong>
-                    <small>打开</small>
-                  </button>
-                ))}
-              </div>
-              <small className="progress-next-note">这些入口仅负责页面跳转；现有接口、生成与保存逻辑保持不变。</small>
+                  </section>
+                )}
             </aside>
           </div>
           )}
@@ -4597,6 +5238,71 @@ function LearningProgressView({
         说明：岗位能力采用固定权重、贝叶斯小样本收缩、独立尝试去重和来源审核。Quiz 只能形成知识证据；操作、质量与维护能力还必须有已复核的实操证据。本模型不等同于国家职业资格证书。
       </p>
       </main>
+
+      {advanceDialogOpen && currentPathChapter && nextPathChapter && (
+        <div
+          className="section-advance-backdrop"
+          role="presentation"
+          onMouseDown={() => {
+            if (!advanceBusy) setAdvanceDialogOpen(false);
+          }}
+        >
+          <section
+            className={`section-advance-dialog ${readinessPassed ? "ready" : "blocked"}`}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="section-advance-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <span className="section-advance-dialog-symbol" aria-hidden="true">
+              {readinessPassed ? "✓" : "!"}
+            </span>
+            <div className="section-advance-dialog-copy">
+              <span className="eyebrow">
+                {currentPathChapter.chapter_id} → {nextPathChapter.chapter_id}
+              </span>
+              <h2 id="section-advance-title">
+                {readinessPassed
+                  ? "您对当前小节掌握得很好"
+                  : "您对当前小节的掌握度不足"}
+              </h2>
+              <p>
+                {readinessPassed
+                  ? `后端学习证据已达到当前小节的通过条件。是否确认进入“${nextPathChapter.chapter_title}”？`
+                  : `建议先补足当前小节的讲义与 Quiz 学习证据。您仍可以确认进入“${nextPathChapter.chapter_title}”，但知链会保留本次未达标提醒。`}
+              </p>
+              {!readinessPassed && readinessBlockers.length > 0 && (
+                <ul className="section-advance-blockers">
+                  {readinessBlockers.map((message) => (
+                    <li key={message}>{message}</li>
+                  ))}
+                </ul>
+              )}
+              {advanceError && <p className="inline-error">{advanceError}</p>}
+            </div>
+            <div className="section-advance-dialog-actions">
+              <button
+                type="button"
+                className="keep-learning"
+                disabled={advanceBusy}
+                onClick={() => setAdvanceDialogOpen(false)}
+              >
+                再学习一段时间
+              </button>
+              <button
+                type="button"
+                className="confirm-advance"
+                disabled={advanceBusy || busy}
+                onClick={() => void confirmSectionAdvance()}
+              >
+                {advanceBusy || busy
+                  ? "正在切换学习小节…"
+                  : "确认进入下一节学习"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {detailPanel && (
         <div

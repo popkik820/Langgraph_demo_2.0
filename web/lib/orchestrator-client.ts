@@ -35,6 +35,8 @@ export function buildAgentRequest(input: OrchestratorInput): AgentRequest {
     learner_profile: input.profile,
     learning_progress: input.learningProgress,
     quiz_blueprint_input: input.quizBlueprint,
+    force_advance: input.forceAdvance,
+    force_reason: input.forceReason,
     profile_md_version: new Date().toISOString().slice(0, 10),
     qa_session_id: input.qaSessionId,
     options: {

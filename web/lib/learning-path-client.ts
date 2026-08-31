@@ -81,12 +81,18 @@ function selectCurrentChapter(
   const relevant = progress.filter((item) => validIds.has(item.chapter_id));
   const active = relevant
     .filter((item) =>
-      ["in_progress", "needs_review", "learning"].includes(
+      ["in_progress", "learning"].includes(
         String(item.status || "").toLowerCase(),
       ),
     )
     .sort((left, right) => updatedTimestamp(right) - updatedTimestamp(left));
   if (active[0]) return active[0].chapter_id;
+  const review = relevant
+    .filter(
+      (item) => String(item.status || "").toLowerCase() === "needs_review",
+    )
+    .sort((left, right) => updatedTimestamp(right) - updatedTimestamp(left));
+  if (review[0]) return review[0].chapter_id;
   const latest = [...relevant].sort(
     (left, right) => updatedTimestamp(right) - updatedTimestamp(left),
   )[0];

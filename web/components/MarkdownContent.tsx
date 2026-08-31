@@ -1,26 +1,10 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { normalizeGeneratedMarkdown } from "@/lib/markdown-content";
 
 type MarkdownContentProps = {
   content: string;
 };
-
-function normalizeSectionHeadings(content: string) {
-  return content
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .map((line) => {
-      const standaloneBold = line.match(/^\s*\*\*\s*(.+?)\s*\*\*\s*$/);
-
-      if (!standaloneBold) {
-        return line;
-      }
-
-      return `## ${standaloneBold[1].trim()}`;
-    })
-    .join("\n")
-    .trim();
-}
 
 export function MarkdownContent({ content }: MarkdownContentProps) {
   return (
@@ -41,7 +25,7 @@ export function MarkdownContent({ content }: MarkdownContentProps) {
           ),
         }}
       >
-        {normalizeSectionHeadings(content)}
+        {normalizeGeneratedMarkdown(content)}
       </ReactMarkdown>
     </div>
   );
